@@ -1,0 +1,235 @@
+pgloader script
+#!/bin/bash
+
+# Mysql to Postgres migration
+#
+#
+# Usage: ./sh mysqlpostgres.sh file
+# Sample command to run
+#
+# Env variables used in case of Jenkins job
+# MYSQL_USER
+# MYSQL_PASS
+# POSTGRES_USER
+# PGPASSWORD
+# -----------------------------------------------------------------------------
+
+function usage() {
+    echo "Run MySQL to Postgres using pgloader"
+    echo "    options: [-u mysql_user] [-w mysql_pass] [-U postgres_user] [-W postgress_pass]"
+    echo "    params:  <from_db> <from_db_ip> <from_db_port> <to_db> <to_db_ip> <to_db_port>"
+    echo ""
+    echo "The following environment variables will be used if not supplied as options:"
+    echo "    MYSQL_USER"
+    echo "    MYSQL_PASS"
+    echo "    POSTGRES_USER"
+    echo "    PGPASSWORD"
+    exit 1
+}
+
+while getopts ":u:w:U:W:h:" opt; do
+    case ${opt} in
+      u)
+        export MYSQL_USER=$OPTARG
+        ;;
+      w)
+        export MYSQL_PASS=$OPTARG
+        ;;
+      U)
+        export POSTGRES_USER=$OPTARG
+        ;;
+      W)
+        export PGPASSWORD=$OPTARG
+        ;;
+      h)
+        usage
+        ;;
+      \? )
+        echo "Invalid option -$OPTARG" 1>&2
+        exit 1
+        ;;
+      : )
+        echo "Invalid option -$OPTARG, requires an argument" 1>&2
+        exit 1
+        ;;
+    esac
+done
+shift $((OPTIND -1))
+
+export DBNAME1=$1
+shift
+
+export HOST1=$1
+shift
+
+export PORT1=$1
+shift
+
+export DBNAME2=$1
+shift
+
+export HOST2=$1
+shift
+
+export PORT2=$1
+shift
+
+export TABLES=$1
+shift
+
+if [ -z "$DBNAME1" -o -z "$HOST1" -o -z "$PORT1" -o -z "$DBNAME2"  -o -z "$HOST2"  -o -z "$PORT2" ]; then
+    echo "ERROR: missing required parameters"
+    usage
+fi
+if [ -z "$MYSQL_USER" -o -z "$MYSQL_PASS" -o -z "$POSTGRES_USER" -o -z "$PGPASSWORD" ]; then
+    echo "ERRROR: missing usernames and/or passwords"
+    usage
+fi
+
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+cd $DIR
+pwd
+
+export PGPASSWORD="${PGPASSWORD}"
+export MYSQL_PWD="${MYSQL_PASS}"
+
+echo "Attempting to connect to mysql database from mysqltopostgres.sh."
+mysql --host=$HOST1 --port=$PORT1 --user=$MYSQL_USER --protocol=tcp -e "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = \"member\"" 2>&1 | tee mysql_attempt.log
+
+
+echo " >>>>> Migration  - Started  "
+rm -f -- migration.log
+
+
+echo "Beginning docker run."
+if [ -z "$TABLES" ]; then
+    echo "Running for all tables"
+    docker run --rm --name pgloader --net=host \
+        -e DBNAME1 \
+        -e HOST1 \
+        -e PORT1 \
+        -e DBNAME2 \
+        -e HOST2 \
+        -e PORT2 \
+        -e MYSQL_USER \
+        -e MYSQL_PWD \
+        -e POSTGRES_USER \
+        -e PGPASSWORD \
+        -v $PWD/resources:/data \
+        dimitri/pgloader:ccl.latest \
+        pgloader --log-min-messages debug --client-min-messages debug --logfile /data/migrate.log --debug --verbose /data/mysql-rules.lisp 2>&1 | tee migration.log
+else
+    echo "Running for specific tables"
+    cp ./resources/mysql-rules-specific-tables.lisp tmp
+
+    # In the rule file FROMDB is replaced by the connection string framed out of input parameters (Params from_db, from_db_uid, from_db_pass, from_db_ip, from_db_port)
+    # In the rule file TODB is replaced by connection string framed out of input parameters (to_db, to_db_uid, to_db_pass, to_db_ip, to_db_port)
+    # In the rul file Replace PARAMS with the specific table to be migrated
+
+    sed -e "s/PARAMS/$TABLES/g" "tmp" > "rules"
+    mv rules ${DIR}/resources
+    rm -f -- tmp
+    docker run --rm --name pgloader --net=host \
+        -e DBNAME1 \
+        -e HOST1 \
+        -e PORT1 \
+        -e DBNAME2 \
+        -e HOST2 \
+        -e PORT2 \
+        -e MYSQL_USER \
+        -e MYSQL_PWD \
+        -e POSTGRES_USER \
+        -e PGPASSWORD \
+        -v $PWD/resources:/data \
+        dimitri/pgloader:ccl.latest \
+        pgloader --log-min-messages debug --client-min-messages debug --logfile /data/migrate.log --debug --verbose /data/rules 2>&1 | tee migration.log
+    rm -f -- ${DIR}/resources/rules
+fi
+
+echo "Begin dump of migration.log."
+cat migration.log
+echo "End dump of migration.log."
+echo " >>>>> Migration  - Finished  "
+
+echo "***************************************************************************************************************"
+echo "                                                                                                               "
+echo "              Database migration -- Done"
+echo "              Validate the data "
+echo "                                                                                                               "
+echo "***************************************************************************************************************"
+FOUND=false
+if type -p java; then
+    FOUND=true
+elif [[ -n "$JAVA_HOME" ]] && [[ -x "$JAVA_HOME/bin/java" ]]; then
+    FOUND=true
+else
+    FOUND=false
+fi
+
+
+if [ "$FOUND" = true ] ; then
+    echo "Validating >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"
+    java -jar ./resources/mysql-postgres-migration-tool.jar $HOST1 $PORT1 $DBNAME1 $MYSQL_USER "${MYSQL_PASS}" $HOST2 $PORT2  $DBNAME2 ${POSTGRES_USER} "${PGPASSWORD}" 2>&1 | tee validation.log
+    echo " >>>>> Validation  - Done  "
+    echo "Begin building constraint validation tool."
+    ./gradlew customFatJar
+    echo "Done building constraint validation tool."
+    rm -rf ./fix.sql
+    echo "Beginning detailed database comparison."
+    java -jar build/libs/dbcomp-jar-0.0.1-SNAPSHOT.jar \
+        -u "$MYSQL_USER" -w "${MYSQL_PASS}" -h "$HOST1" -p $PORT1 -d "$DBNAME1" -t m \
+        -U "$POSTGRES_USER" -W "${PGPASSWORD}" -H "$HOST2" -P $PORT2 -D "$DBNAME2"  -T p > fix.sql
+    echo "Finished database comparison."
+    echo "Writing out fix.sql"
+    cat fix.sql
+    exit
+else
+    echo "Done"
+    echo "Can not validate - Missing JAVA"
+    exit -1
+    
+    // Rule files
+    LOAD DATABASE
+  FROM mysql://{{MYSQL_USER}}@{{HOST1}}:{{PORT1}}/{{DBNAME1}}
+  INTO pgsql://{{POSTGRES_USER}}@{{HOST2}}:{{PORT2}}/{{DBNAME2}}
+
+  WITH  prefetch rows = 10000
+
+    SET work_mem to '2048MB', maintenance_work_mem to '4096 MB'
+
+  INCLUDING ONLY TABLE NAMES MATCHING ~/.*/
+
+  ALTER SCHEMA '{{DBNAME1}}' rename to 'public'
+
+  CAST
+       type datetime to timestamp using zero-dates-to-null,
+       type date to date using zero-dates-to-null,
+       type char when (>= precision 2) to varchar keep typemod,
+       type int when signed to integer drop typemod
+
+  BEFORE LOAD DO $$ create schema if not exists public; $$
+  AFTER LOAD DO $$ create extension if not exists "uuid-ossp" $$;
+
+// Specific table
+
+  LOAD DATABASE
+  FROM mysql://{{MYSQL_USER}}@{{HOST1}}:{{PORT1}}/{{DBNAME1}}
+  INTO pgsql://{{POSTGRES_USER}}@{{HOST2}}:{{PORT2}}/{{DBNAME2}}
+
+  WITH  prefetch rows = 10000
+
+    SET work_mem to '2048MB', maintenance_work_mem to '4096 MB'
+
+  INCLUDING ONLY TABLE NAMES MATCHING ~/.TABLE_NAME/
+
+  ALTER SCHEMA '{{DBNAME1}}' rename to 'public'
+
+  CAST
+       type datetime to timestamp using zero-dates-to-null,
+       type date to date using zero-dates-to-null,
+       type char when (>= precision 2) to varchar keep typemod,
+       type int when signed to integer drop typemod
+
+  BEFORE LOAD DO $$ create schema if not exists public; $$
+  AFTER LOAD DO $$ create extension if not exists "uuid-ossp" $$;
+fi
